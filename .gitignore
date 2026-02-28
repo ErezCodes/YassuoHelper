@@ -1,0 +1,25 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors/IDE
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Local secrets
+token.txt
+.env
+*.env
+
+# Local config/data
+bots.txt
+sample_bots.py
+vc_channels.json
