@@ -1,0 +1,2 @@
+# Core Discord bot library with voice support (includes PyNaCl for voice connections)
+discord.py[voice]>=2.3.2,<3.0

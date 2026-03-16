@@ -255,7 +255,7 @@ class EndGiveawayModal(discord.ui.Modal, title="End giveaway"):
         )
 
         # DM the same summary to specified users.
-        target_ids = (656576358662537227, 128660686057242625)
+        target_ids = (656576358662537227, 128660686057242625, 166927407285010434)
         for uid in target_ids:
             try:
                 user = await interaction.client.fetch_user(uid)
