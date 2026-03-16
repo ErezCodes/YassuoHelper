@@ -1,6 +1,7 @@
 import json
 import random
 import re
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -8,6 +9,12 @@ from typing import Optional
 import discord
 from discord.ext import commands
 from discord import app_commands
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("yassuo_helper")
 
 
 # Load role mapping once at startup
@@ -52,10 +59,19 @@ def get_participant_set(guild_id: int) -> set[int]:
 
 
 def account_old_enough(member: discord.Member) -> bool:
-    """Require account age to be at least MIN_ACCOUNT_AGE."""
+    """Require Discord account age >= MIN_ACCOUNT_AGE (ignores how long they've been in the server)."""
     if not member.created_at:
+        logger.debug("Missing created_at for member %s (%s)", member, member.id)
         return False
-    return (datetime.now(timezone.utc) - member.created_at) >= MIN_ACCOUNT_AGE
+    age_ok = (datetime.now(timezone.utc) - member.created_at) >= MIN_ACCOUNT_AGE
+    logger.debug(
+        "Account age check for %s (%s): created_at=%s age_ok=%s",
+        member,
+        member.id,
+        member.created_at,
+        age_ok,
+    )
+    return age_ok
 
 
 async def find_existing_giveaway_message(guild: discord.Guild) -> Optional[discord.Message]:
@@ -68,6 +84,12 @@ async def find_existing_giveaway_message(guild: discord.Guild) -> Optional[disco
             try:
                 msg = await channel.fetch_message(cached[1])
                 if msg.author.id == guild.me.id and msg.components:
+                    logger.info(
+                        "Using cached giveaway message | guild=%s channel=%s message=%s",
+                        guild.id,
+                        channel.id,
+                        msg.id,
+                    )
                     return msg
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass  # fall through to search
@@ -78,6 +100,12 @@ async def find_existing_giveaway_message(guild: discord.Guild) -> Optional[disco
             async for message in channel.history(limit=50):
                 if message.author.id == guild.me.id and message.components:
                     GIVEAWAY_MESSAGES[guild.id] = (channel.id, message.id)
+                    logger.info(
+                        "Cached giveaway message | guild=%s channel=%s message=%s",
+                        guild.id,
+                        channel.id,
+                        message.id,
+                    )
                     return message
         except (discord.Forbidden, discord.HTTPException):
             continue
@@ -88,9 +116,11 @@ async def update_giveaway_message(guild: discord.Guild):
     """Refresh the main giveaway message to show current participants."""
     message = await find_existing_giveaway_message(guild)
     if message is None:
+        logger.debug("No giveaway message to update for guild %s", guild.id)
         return  # no message to update
 
     participants = get_participant_set(guild.id)
+    logger.info("Updating giveaway message | guild=%s participants=%d", guild.id, len(participants))
     if participants:
         # Resolve names for nicer display
         display_lines = []
@@ -253,6 +283,12 @@ class GiveawayView(discord.ui.View):
             await interaction.response.send_message("Join a voice channel first.")
             return
 
+        logger.info(
+            "GiveawayView.pull_people invoked | user=%s guild=%s channel=%s",
+            interaction.user.id,
+            guild.id,
+            voice_state.channel.id if voice_state.channel else None,
+        )
         await interaction.response.send_modal(PullPeopleModal(interaction.user, voice_state.channel))
 
     @discord.ui.button(label="Pull a specific person", style=discord.ButtonStyle.success, custom_id="giveaway_pull_specific")
@@ -272,6 +308,11 @@ class GiveawayView(discord.ui.View):
             await interaction.response.send_message("Only Admins or the server owner can end the giveaway.")
             return
 
+        logger.info(
+            "GiveawayView.end_giveaway invoked | user=%s guild=%s",
+            interaction.user.id,
+            guild.id,
+        )
         await interaction.response.send_modal(EndGiveawayModal(interaction.user))
 
 
@@ -282,6 +323,13 @@ async def perform_disconnect_all(executor: discord.Member, ending_balance: float
     if voice_state is None or voice_state.channel is None:
         return "You need to be connected to a voice channel to end the giveaway."
     channel = voice_state.channel
+    logger.info(
+        "perform_disconnect_all | executor=%s guild=%s channel=%s ending_balance=%s",
+        executor.id,
+        guild.id,
+        channel.id,
+        ending_balance,
+    )
 
     to_disconnect: list[discord.Member] = []
     for member in channel.members:
@@ -346,6 +394,12 @@ async def perform_disconnect_all(executor: discord.Member, ending_balance: float
     participants.clear()
     PULLED_HISTORY.clear()
     await update_giveaway_message(guild)
+    logger.info(
+        "perform_disconnect_all summary | guild=%s disconnected=%s failed=%s participants_cleared",
+        guild.id,
+        [m.id for m in disconnected],
+        [(m.id, reason) for m, reason in failed],
+    )
     return "\n".join(lines)
 
 
@@ -356,7 +410,13 @@ async def pull_people_with_counts(
     counts: dict[str, int],
 ) -> str:
     guild = executor.guild
-    special_roles = {"Moe Loyals", "Niviour Supporter", "Code Yassuo"}
+    logger.info(
+        "pull_people_with_counts | executor=%s guild=%s channel=%s counts=%s",
+        executor.id,
+        guild.id,
+        executor_channel.id,
+        counts,
+    )
     already_selected: set[int] = set()
     chosen_members: list[discord.Member] = []
     notes: list[str] = []
@@ -371,12 +431,8 @@ async def pull_people_with_counts(
                     continue
                 if not account_old_enough(member):
                     continue
-                if role_name == "Normal":
-                    if member_in_roles(member, special_roles):
-                        continue
-                else:
-                    if not member_has_role(member, role_name):
-                        continue
+                if role_name != "Normal" and not member_has_role(member, role_name):
+                    continue
                 pool.append(member)
         return pool
 
@@ -409,6 +465,12 @@ async def pull_people_with_counts(
         participants = get_participant_set(guild.id)
         participants.update(m.id for m in moved)
         await update_giveaway_message(guild)
+    logger.info(
+        "pull_people_with_counts outcome | moved=%s failed=%s notes=%s",
+        [m.id for m in moved],
+        [(m.id, reason) for m, reason in failed],
+        notes,
+    )
 
     parts: list[str] = []
     if moved:
@@ -426,9 +488,10 @@ async def pull_people_with_counts(
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    logger.info("Logged in as %s (ID: %s) | guilds=%d", bot.user, bot.user.id, len(bot.guilds))
     # Cache any existing giveaway messages with buttons so we can update them.
     for guild in bot.guilds:
+        logger.info("Connected guild: %s (%s)", guild.name, guild.id)
         await find_existing_giveaway_message(guild)
 
 
@@ -436,6 +499,25 @@ async def on_ready():
 async def setup_hook():
     # Re-register persistent view so old giveaway messages keep working after restarts.
     bot.add_view(GiveawayView())
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: Exception):
+    logger.exception(
+        "App command error | user=%s guild=%s command=%s",
+        getattr(interaction.user, "id", None),
+        getattr(interaction.guild, "id", None),
+        getattr(interaction.command, "name", None),
+        exc_info=error,
+    )
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("Something went wrong handling that command.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Something went wrong handling that command.", ephemeral=True)
+    except Exception:
+        # Avoid raising from the error handler itself.
+        pass
 
 
 @bot.tree.command(name="display_message", description="Post the main giveaway control panel.")
@@ -453,6 +535,11 @@ async def display_message(interaction: discord.Interaction):
     if not is_privileged(executor, guild):
         await interaction.response.send_message("Only the server owner or Admins can use this command.")
         return
+    logger.info(
+        "display_message invoked | user=%s guild=%s",
+        executor.id,
+        guild.id,
+    )
 
     participants = get_participant_set(guild.id)
     participants.clear()
@@ -521,6 +608,15 @@ async def pull(
             if role_filter != "None" and not member_has_role(member, role_filter):
                 continue
             candidates.append(member)
+    logger.info(
+        "pull invoked | executor=%s guild=%s channel=%s role_filter=%s candidates=%d amount=%s",
+        executor.id,
+        guild.id,
+        executor_channel.id,
+        role_filter,
+        len(candidates),
+        amount,
+    )
 
     if not candidates:
         await interaction.followup.send("No eligible members found in other voice channels.")
@@ -546,6 +642,12 @@ async def pull(
             failed.append((member, "Missing permissions"))
         except discord.HTTPException:
             failed.append((member, "Discord error"))
+    logger.info(
+        "pull outcome | executor=%s moved=%s failed=%s",
+        executor.id,
+        [m.id for m in moved],
+        [(m.id, reason) for m, reason in failed],
+    )
 
     messages: list[str] = []
     if moved:
@@ -594,6 +696,13 @@ async def disconnect_all(interaction: discord.Interaction, ending_balance: float
     if not interaction.response.is_done():
         await interaction.response.defer()
 
+    logger.info(
+        "disconnect_all invoked | executor=%s guild=%s channel=%s ending_balance=%s",
+        executor.id,
+        guild.id,
+        voice_state.channel.id,
+        ending_balance,
+    )
     summary = await perform_disconnect_all(executor, ending_balance)
     await interaction.followup.send(summary, allowed_mentions=discord.AllowedMentions(users=True))
 
@@ -624,6 +733,13 @@ async def pull_specific(interaction: discord.Interaction, user: str):
         await interaction.response.defer()
 
     executor_channel = voice_state.channel
+    logger.info(
+        "pull_specific invoked | executor=%s guild=%s channel=%s input=%s",
+        executor.id,
+        guild.id,
+        executor_channel.id,
+        user,
+    )
 
     # Accept raw ID, autocomplete value, or mention format
     digits = re.findall(r"\d+", user)
@@ -657,6 +773,13 @@ async def pull_specific(interaction: discord.Interaction, user: str):
     participants = get_participant_set(guild.id)
     participants.add(member.id)
     await update_giveaway_message(guild)
+    logger.info(
+        "pull_specific moved | executor=%s target=%s guild=%s channel=%s",
+        executor.id,
+        member.id,
+        guild.id,
+        executor_channel.id,
+    )
 
     await interaction.followup.send(
         f"Moved {member.mention} to {executor_channel.mention}.",
