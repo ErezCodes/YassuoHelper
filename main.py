@@ -26,6 +26,8 @@ with ROLES_PATH.open("r", encoding="utf-8") as fp:
 PULLED_HISTORY: list[str] = []
 GIVEAWAY_MESSAGES: dict[int, tuple[int, int]] = {}  # guild_id -> (channel_id, message_id)
 GIVEAWAY_PARTICIPANTS: dict[int, set[int]] = {}  # guild_id -> {user_ids}
+RANDOM_PICK_COOLDOWN = timedelta(hours=4)
+RANDOM_PICK_COOLDOWNS: dict[int, dict[int, datetime]] = {}  # guild_id -> {user_id: cooldown_end_utc}
 MIN_ACCOUNT_AGE = timedelta(days=180)  # ~6 months
 
 # Precompute slash-command choices: "None" first, then roles.json order
@@ -37,6 +39,7 @@ intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
 intents.guilds = True
+intents.presences = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -56,6 +59,67 @@ def is_privileged(member: discord.Member, guild: discord.Guild) -> bool:
 
 def get_participant_set(guild_id: int) -> set[int]:
     return GIVEAWAY_PARTICIPANTS.setdefault(guild_id, set())
+
+
+def _status_name(status: object) -> str:
+    name = getattr(status, "name", None)
+    if isinstance(name, str):
+        return name.lower()
+    return str(status).lower()
+
+
+def member_uses_browser_client(member: discord.Member) -> bool:
+    """Return True when member is currently online from Discord web client."""
+    return _status_name(member.web_status) != "offline"
+
+
+def parse_ending_balance(value: str) -> tuple[Optional[float], str]:
+    """Parse ending balance and optional currency prefix (supports C$...)."""
+    raw_value = (value or "").strip()
+    if not raw_value:
+        return None, "$"
+
+    currency_prefix = "$"
+    lowered = raw_value.lower()
+    if lowered.startswith("c$"):
+        currency_prefix = "C$"
+        raw_value = raw_value[2:].strip()
+    elif raw_value.startswith("$"):
+        raw_value = raw_value[1:].strip()
+
+    normalized = raw_value.replace(",", "")
+    try:
+        return float(normalized), currency_prefix
+    except ValueError:
+        return None, currency_prefix
+
+
+def get_random_pick_cooldown_map(guild_id: int) -> dict[int, datetime]:
+    return RANDOM_PICK_COOLDOWNS.setdefault(guild_id, {})
+
+
+def is_random_pick_eligible(guild_id: int, user_id: int, now: Optional[datetime] = None) -> bool:
+    cooldowns = get_random_pick_cooldown_map(guild_id)
+    ends_at = cooldowns.get(user_id)
+    if ends_at is None:
+        return True
+
+    current = now or datetime.now(timezone.utc)
+    if ends_at <= current:
+        cooldowns.pop(user_id, None)
+        if not cooldowns:
+            RANDOM_PICK_COOLDOWNS.pop(guild_id, None)
+        return True
+    return False
+
+
+def mark_randomly_picked(guild_id: int, user_ids: list[int]):
+    if not user_ids:
+        return
+    cooldowns = get_random_pick_cooldown_map(guild_id)
+    ends_at = datetime.now(timezone.utc) + RANDOM_PICK_COOLDOWN
+    for user_id in user_ids:
+        cooldowns[user_id] = ends_at
 
 
 def account_old_enough(member: discord.Member) -> bool:
@@ -191,6 +255,7 @@ class PullPeopleModal(discord.ui.Modal, title="Pull people"):
             self.add_item(field)
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         counts = {
             "Moe Loyals": self._parse_int(self.moe_count.value),
             "Niviour Supporter": self._parse_int(self.niviour_count.value),
@@ -203,7 +268,7 @@ class PullPeopleModal(discord.ui.Modal, title="Pull people"):
             executor_channel=self.executor_channel,
             counts=counts,
         )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             summary,
             ephemeral=True,  # input-driven result; keep private to the submitter
             allowed_mentions=discord.AllowedMentions(users=True),
@@ -228,33 +293,32 @@ class EndGiveawayModal(discord.ui.Modal, title="End giveaway"):
 
         self.ending_balance = discord.ui.TextInput(
             label="What is the ending balance of this group?",
-            placeholder="e.g., 123.45",
+            placeholder="e.g., 123.45 or C$123.45",
             required=True,
             max_length=20,
         )
         self.add_item(self.ending_balance)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Accept numbers that may include commas and/or dollar signs.
-        raw_value = (self.ending_balance.value or "").replace("$", "").replace(",", "").strip()
-        try:
-            balance = float(raw_value)
-        except ValueError:
+        balance, currency_prefix = parse_ending_balance(self.ending_balance.value)
+        if balance is None:
             await interaction.response.send_message(
-                "Please enter a valid number for the ending balance.",
+                "Please enter a valid number for the ending balance (or use C$123.45).",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
-        summary = await perform_disconnect_all(self.executor, balance)
+        await interaction.response.defer(thinking=True)
+        summary = await perform_disconnect_all(self.executor, balance, currency_prefix)
 
         # Public response in-channel.
-        await interaction.response.send_message(
+        await interaction.followup.send(
             summary,
             allowed_mentions=discord.AllowedMentions(users=True),
         )
+        await reset_giveaway_state(self.guild)
 
-        # DM the same summary to specified users.
+        # DM the same summary to the configured recipients.
         target_ids = (656576358662537227, 128660686057242625, 166927407285010434)
         for uid in target_ids:
             try:
@@ -316,7 +380,15 @@ class GiveawayView(discord.ui.View):
         await interaction.response.send_modal(EndGiveawayModal(interaction.user))
 
 
-async def perform_disconnect_all(executor: discord.Member, ending_balance: float) -> str:
+async def reset_giveaway_state(guild: discord.Guild):
+    participants = get_participant_set(guild.id)
+    participants.clear()
+    PULLED_HISTORY.clear()
+    await update_giveaway_message(guild)
+    logger.info("reset_giveaway_state | guild=%s participants_cleared", guild.id)
+
+
+async def perform_disconnect_all(executor: discord.Member, ending_balance: float, currency_prefix: str = "$") -> str:
     """Shared logic for ending giveaway/disconnecting, returns summary text."""
     guild = executor.guild
     voice_state = executor.voice
@@ -324,11 +396,12 @@ async def perform_disconnect_all(executor: discord.Member, ending_balance: float
         return "You need to be connected to a voice channel to end the giveaway."
     channel = voice_state.channel
     logger.info(
-        "perform_disconnect_all | executor=%s guild=%s channel=%s ending_balance=%s",
+        "perform_disconnect_all | executor=%s guild=%s channel=%s ending_balance=%s currency=%s",
         executor.id,
         guild.id,
         channel.id,
         ending_balance,
+        currency_prefix,
     )
 
     to_disconnect: list[discord.Member] = []
@@ -365,9 +438,15 @@ async def perform_disconnect_all(executor: discord.Member, ending_balance: float
         lines.append("No members to disconnect (all present are exempt).")
 
     participants = get_participant_set(guild.id)
+    participant_ids = set(participants)
+    if not participant_ids:
+        # Fallback for cases where in-memory participant tracking was lost/restarted.
+        participant_ids.update(m.id for m in disconnected)
+        participant_ids.update(m.id for m, _ in failed)
+
     # Build formatted participant list for summary output
     participant_lines: list[str] = []
-    for user_id in participants:
+    for user_id in sorted(participant_ids):
         member = guild.get_member(user_id)
         if member:
             participant_lines.append(f"- {member.mention} [{member.name}] ({member.id})")
@@ -375,10 +454,10 @@ async def perform_disconnect_all(executor: discord.Member, ending_balance: float
             participant_lines.append(f"- <@{user_id}> ({user_id})")
 
     participant_section = "\n".join(participant_lines) if participant_lines else "- None"
-    participant_count = len(participants)
-    total_winnings = f"${ending_balance:.2f}"
+    participant_count = len(participant_ids)
+    total_winnings = f"{currency_prefix}{ending_balance:.2f}"
     per_person = (
-        f"${(ending_balance / participant_count):.2f}"
+        f"{currency_prefix}{(ending_balance / participant_count):.2f}"
         if participant_count > 0
         else "N/A (no participants)"
     )
@@ -389,16 +468,12 @@ async def perform_disconnect_all(executor: discord.Member, ending_balance: float
         f"Total winnings: {total_winnings}",
         f"Amount for each person when divided equally: {per_person}",
     ]
-
-    # Reset participants
-    participants.clear()
-    PULLED_HISTORY.clear()
-    await update_giveaway_message(guild)
     logger.info(
-        "perform_disconnect_all summary | guild=%s disconnected=%s failed=%s participants_cleared",
+        "perform_disconnect_all summary | guild=%s disconnected=%s failed=%s participants_in_summary=%d",
         guild.id,
         [m.id for m in disconnected],
         [(m.id, reason) for m, reason in failed],
+        participant_count,
     )
     return "\n".join(lines)
 
@@ -421,8 +496,11 @@ async def pull_people_with_counts(
     chosen_members: list[discord.Member] = []
     notes: list[str] = []
 
-    def candidates_for_role(role_name: str) -> list[discord.Member]:
+    def candidates_for_role(role_name: str) -> tuple[list[discord.Member], int, int]:
         pool: list[discord.Member] = []
+        cooldown_blocked = 0
+        browser_blocked = 0
+        now = datetime.now(timezone.utc)
         for channel in guild.voice_channels:
             if channel.id == executor_channel.id:
                 continue
@@ -433,15 +511,34 @@ async def pull_people_with_counts(
                     continue
                 if role_name != "Normal" and not member_has_role(member, role_name):
                     continue
+                if member_uses_browser_client(member):
+                    browser_blocked += 1
+                    continue
+                if not is_random_pick_eligible(guild.id, member.id, now):
+                    cooldown_blocked += 1
+                    continue
                 pool.append(member)
-        return pool
+        return pool, cooldown_blocked, browser_blocked
 
     for role_name, requested in counts.items():
         if requested <= 0:
             continue
-        pool = candidates_for_role(role_name)
+        pool, cooldown_blocked, browser_blocked = candidates_for_role(role_name)
         if not pool:
-            notes.append(f"No available {role_name} to pull.")
+            if cooldown_blocked and browser_blocked:
+                notes.append(
+                    f"No available {role_name} to pull ({cooldown_blocked} on cooldown, {browser_blocked} using browser)."
+                )
+            elif cooldown_blocked:
+                notes.append(
+                    f"No available {role_name} to pull ({cooldown_blocked} on random-pick cooldown)."
+                )
+            elif browser_blocked:
+                notes.append(
+                    f"No available {role_name} to pull ({browser_blocked} using browser)."
+                )
+            else:
+                notes.append(f"No available {role_name} to pull.")
             continue
         take = min(requested, len(pool))
         if take < requested:
@@ -462,6 +559,7 @@ async def pull_people_with_counts(
             failed.append((member, "Discord error"))
 
     if moved:
+        mark_randomly_picked(guild.id, [m.id for m in moved])
         participants = get_participant_set(guild.id)
         participants.update(m.id for m in moved)
         await update_giveaway_message(guild)
@@ -599,6 +697,9 @@ async def pull(
     # Build candidate list
     role_filter = required_role.value
     candidates: list[discord.Member] = []
+    cooldown_blocked = 0
+    browser_blocked = 0
+    now = datetime.now(timezone.utc)
     for channel in guild.voice_channels:
         if channel.id == executor_channel.id:
             continue  # exclude members already with the executor
@@ -607,24 +708,51 @@ async def pull(
                 continue
             if role_filter != "None" and not member_has_role(member, role_filter):
                 continue
+            if member_uses_browser_client(member):
+                browser_blocked += 1
+                continue
+            if not is_random_pick_eligible(guild.id, member.id, now):
+                cooldown_blocked += 1
+                continue
             candidates.append(member)
     logger.info(
-        "pull invoked | executor=%s guild=%s channel=%s role_filter=%s candidates=%d amount=%s",
+        "pull invoked | executor=%s guild=%s channel=%s role_filter=%s candidates=%d cooldown_blocked=%d browser_blocked=%d amount=%s",
         executor.id,
         guild.id,
         executor_channel.id,
         role_filter,
         len(candidates),
+        cooldown_blocked,
+        browser_blocked,
         amount,
     )
 
     if not candidates:
-        await interaction.followup.send("No eligible members found in other voice channels.")
+        if cooldown_blocked and browser_blocked:
+            await interaction.followup.send(
+                f"No eligible members found in other voice channels ({cooldown_blocked} on random-pick cooldown, {browser_blocked} using browser)."
+            )
+        elif cooldown_blocked:
+            await interaction.followup.send(
+                f"No eligible members found in other voice channels ({cooldown_blocked} on random-pick cooldown)."
+            )
+        elif browser_blocked:
+            await interaction.followup.send(
+                f"No eligible members found in other voice channels ({browser_blocked} using browser)."
+            )
+        else:
+            await interaction.followup.send("No eligible members found in other voice channels.")
         return
 
     if amount > len(candidates):
+        reasons: list[str] = []
+        if cooldown_blocked:
+            reasons.append(f"{cooldown_blocked} on random-pick cooldown")
+        if browser_blocked:
+            reasons.append(f"{browser_blocked} using browser")
+        extra = f" ({', '.join(reasons)})." if reasons else "."
         await interaction.followup.send(
-            f"Requested {amount} member(s) but only {len(candidates)} eligible.",
+            f"Requested {amount} member(s) but only {len(candidates)} eligible{extra}",
         )
         return
 
@@ -651,6 +779,7 @@ async def pull(
 
     messages: list[str] = []
     if moved:
+        mark_randomly_picked(guild.id, [m.id for m in moved])
         pulled_mentions = ", ".join(m.mention for m in moved)
         messages.append(f"Pulled {len(moved)} member(s) into {executor_channel.mention}: {pulled_mentions}")
         PULLED_HISTORY.extend(m.mention for m in moved)
@@ -670,8 +799,8 @@ async def pull(
 
 
 @bot.tree.command(name="disconnect_all", description="Disconnect everyone in your voice channel except owner/Admin/Moderator.")
-@app_commands.describe(ending_balance="Ending balance to report (numbers allowed).")
-async def disconnect_all(interaction: discord.Interaction, ending_balance: float):
+@app_commands.describe(ending_balance="Ending balance to report (example: 123.45 or C$123.45).")
+async def disconnect_all(interaction: discord.Interaction, ending_balance: str):
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message("This command can only be used in a server.")
@@ -691,20 +820,28 @@ async def disconnect_all(interaction: discord.Interaction, ending_balance: float
     if voice_state is None or voice_state.channel is None:
         await interaction.response.send_message("You need to be connected to a voice channel to use /disconnect_all.")
         return
+    parsed_balance, currency_prefix = parse_ending_balance(ending_balance)
+    if parsed_balance is None:
+        await interaction.response.send_message(
+            "Please enter a valid ending balance (example: 123.45 or C$123.45)."
+        )
+        return
 
     # Acknowledge quickly to avoid interaction expiry if the loop below takes time.
     if not interaction.response.is_done():
         await interaction.response.defer()
 
     logger.info(
-        "disconnect_all invoked | executor=%s guild=%s channel=%s ending_balance=%s",
+        "disconnect_all invoked | executor=%s guild=%s channel=%s ending_balance=%s currency=%s",
         executor.id,
         guild.id,
         voice_state.channel.id,
-        ending_balance,
+        parsed_balance,
+        currency_prefix,
     )
-    summary = await perform_disconnect_all(executor, ending_balance)
+    summary = await perform_disconnect_all(executor, parsed_balance, currency_prefix)
     await interaction.followup.send(summary, allowed_mentions=discord.AllowedMentions(users=True))
+    await reset_giveaway_state(guild)
 
 
 @bot.tree.command(name="pull_specific", description="Pull a specific user into your voice channel.")
@@ -755,6 +892,13 @@ async def pull_specific(interaction: discord.Interaction, user: str):
 
     if member.voice is None or member.voice.channel is None:
         await interaction.followup.send(f"{member.mention} is not in a voice channel.", allowed_mentions=discord.AllowedMentions(users=True))
+        return
+
+    if member_uses_browser_client(member):
+        await interaction.followup.send(
+            f"{member.mention} cannot be added to the giveaway while using Discord in a browser.",
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
         return
 
     if member.voice.channel.id == executor_channel.id:
