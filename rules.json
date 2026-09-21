@@ -1,0 +1,12 @@
+{
+    "890675306971676783": {
+        "minimum_account_age_months": 6,
+        "allow_web_browsers": false,
+        "session_repetition_cooldown_seconds": 14400
+    },
+    "1293870697382154250": {
+        "minimum_account_age_months": 6,
+        "allow_web_browsers": true,
+        "session_repetition_cooldown_seconds": 14400
+    }
+}

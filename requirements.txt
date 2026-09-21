@@ -1,2 +1,5 @@
 # Core Discord bot library with voice support (includes PyNaCl for voice connections)
 discord.py[voice]>=2.3.2,<3.0
+gspread>=6.2,<7.0
+google-auth>=2.0,<3.0
+websockets>=12.0,<16.0

@@ -16,6 +16,8 @@ Thumbs.db
 
 # Local secrets
 token.txt
+google_sheets_credentials.json
+config.json
 .env
 *.env
 
@@ -23,3 +25,6 @@ token.txt
 bots.txt
 sample_bots.py
 vc_channels.json
+
+# Runtime logs
+random_picks.log
