@@ -11,18 +11,11 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
-from web_intent_detector import get_presence
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("yassuo_helper")
-
-# Keep privileged intents disabled until Discord approves them.
-# Set these to True only after enabling the matching switches in the Developer Portal.
-ENABLE_MEMBERS_INTENT = False
-ENABLE_PRESENCES_INTENT = False
 
 # Load role mapping once at startup
 ROLES_PATH = Path("roles.json")
@@ -109,10 +102,10 @@ MESSAGE_LINK_PATTERN = re.compile(
 
 # Bot setup
 intents = discord.Intents.default()
-intents.members = ENABLE_MEMBERS_INTENT
+intents.members = True
 intents.voice_states = True
 intents.guilds = True
-intents.presences = ENABLE_PRESENCES_INTENT
+intents.presences = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -239,13 +232,14 @@ def has_active_giveaway(guild_id: int) -> bool:
     )
 
 
-async def member_uses_browser_client(member: discord.Member) -> bool:
-    """Ask the dedicated Gateway detector whether this member uses Discord web."""
-    try:
-        return await get_presence(str(member.id))
-    except Exception:
-        logger.exception("Web-client lookup failed for member %s", member.id)
-        return False
+def member_uses_browser_client(member: discord.Member) -> bool:
+    """Return whether web is the member's sole active Discord client."""
+    active_statuses = {discord.Status.online, discord.Status.idle, discord.Status.dnd}
+    return (
+        member.web_status in active_statuses
+        and member.desktop_status not in active_statuses
+        and member.mobile_status not in active_statuses
+    )
 
 
 def parse_ending_balance(value: str) -> tuple[Optional[float], str]:
@@ -364,9 +358,8 @@ def account_old_enough(member: discord.Member, guild_id: int) -> bool:
     return age_ok
 
 
-async def browser_allowed(guild_id: int, member: discord.Member) -> bool:
-    uses_browser = await member_uses_browser_client(member)
-    return bool(get_rules(guild_id)["allow_web_browsers"]) or not uses_browser
+def browser_allowed(guild_id: int, member: discord.Member) -> bool:
+    return bool(get_rules(guild_id)["allow_web_browsers"]) or not member_uses_browser_client(member)
 
 
 def _single_line(value: object) -> str:
@@ -433,7 +426,7 @@ async def draw_members(
     while remaining_candidates and len(selected) < amount:
         position = random.randrange(len(remaining_candidates))
         drawn_number, member = remaining_candidates.pop(position)
-        if not await browser_allowed(guild.id, member):
+        if not browser_allowed(guild.id, member):
             browser_blocked += 1
             draw_results.append(
                 f"  Number {drawn_number} -> {_single_line(member.display_name)} "
@@ -1305,7 +1298,7 @@ async def pull(
         )
         return
 
-    # Draw in random order, checking each drawn member with web_intent_detector.
+    # Draw in random order, checking each drawn member's cached client presence.
     chosen_members, browser_blocked = await draw_members(
         guild,
         candidates,
@@ -1511,19 +1504,7 @@ async def pull_specific_autocomplete(interaction: discord.Interaction, current: 
 
     current_lower = current.lower()
     choices: list[app_commands.Choice[str]] = []
-    if ENABLE_MEMBERS_INTENT:
-        members = guild.members
-    else:
-        # Voice-state payloads include the members this command can actually pull,
-        # so autocomplete can remain useful without requesting the full member list.
-        members_by_id = {
-            member.id: member
-            for channel in guild.voice_channels
-            for member in channel.members
-        }
-        members = list(members_by_id.values())
-
-    for member in members:
+    for member in guild.members:
         display = member.display_name or member.name
         if current_lower in display.lower() or current_lower in member.name.lower():
             label = f"{display} ({member.name})"
